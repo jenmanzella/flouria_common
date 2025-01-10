@@ -1,14 +1,22 @@
-"""Primary Controller"""
+"""
+Flouria Primary Controller
+Author: Jen Manzella
+"""
 
 from sqlalchemy import UniqueConstraint
 from sqlalchemy.exc import NoResultFound
-from flouria_models.exceptions.flouria_base import BadRequestError, NotFoundError
+from flouria_models.exceptions.flouria_base import (
+    BadRequestError,
+    NotFoundError,
+    UnauthorizedError
+)
 from flouria_api.response.messages import (
     UPDATE_SUCCESS,
     CREATE_SUCCESS,
     DUPLICATE,
     NOT_FOUND,
     ID_MISMATCH,
+    NOT_PERMITTED
 )
 
 # pylint: disable=R0913, R0917, R0914, R1702, R0912, R1721
@@ -22,16 +30,18 @@ class PrimaryController:
         repository,
         model,
         pydantic_model,
-        # customer: str,
-        account_id: str,
+        customer: str,
+        portal_account_id: str,
         sub_repos=None,
+        customer_list=None
     ):
         self.repository = repository
         self.model = model
-        # self.customer = customer
-        self.account_id = account_id
+        self.customer = customer
+        self.account_id = portal_account_id
         self.pydantic_model = pydantic_model
         self.sub_repos = sub_repos or {}
+        self.customer_list = customer_list
 
     def get_all(
         self,
@@ -103,10 +113,16 @@ class PrimaryController:
 
     def get_by_id(self, model_id, model_fields=None):
         """Fetches model by ID and returns the instance"""
-        try:
-            result = self.repository.get_by_id(model_id)
-        except NoResultFound as e:
-            raise NotFoundError(NOT_FOUND) from e
+        result = self.repository.get_by_id(model_id)
+        if result is None:
+            raise NotFoundError(NOT_FOUND)
+        py_fields = list(self.pydantic_model.__fields__.keys())
+        if self.customer_list and "customer_id" in py_fields:
+            customer_id = getattr(result, "customer_id", None)
+            self._check_permissions(customer_id=customer_id)
+            if result.customer_id != customer_id:
+                raise UnauthorizedError(NOT_PERMITTED)
+
         if model_fields:
             # Validate requested model fields against sub_repos
             valid_models = self.sub_repos.keys()
@@ -259,3 +275,56 @@ class PrimaryController:
 
             # if model instance is found, delete it
             self.repository.delete(model)
+
+    def upsert_user(self, fields, request):
+        attributes = {
+            field: getattr(request, field)
+            for field in fields
+            if hasattr(request, field)
+        }
+        # Determine which fields have unqiue constraints,
+        # this may be relevant if I choose a new primary key
+        # and make customer_id a unique constraint later on
+        unique_fields = []
+        for constraint in self.model.__table__.constraints:
+            if isinstance(constraint, UniqueConstraint):
+                unique_fields.extend([col.name for col in constraint.columns])
+
+        unique_attributes = {
+            field: attributes[field] for field in fields if field in unique_fields
+        }
+        customer_id = getattr(request, "customer_id", None)
+        self._check_permissions(customer_id=customer_id)
+
+
+        if unique_attributes:
+            results = self.repository.search_by_fields(unique_attributes)
+            for result in results:
+                if result.customer_id != customer_id:
+                    raise BadRequestError(DUPLICATE)
+
+        existing = self.repository.search_by_fields({"customer_id": customer_id})
+        if not existing:
+            # add updated_by and created_by
+            if "created_by" in self.model.__table__.columns:
+                attributes["created_by"] = self.account_id
+            if "updated_by" in self.model.__table__.columns:
+                attributes["updated_by"] = self.account_id
+            self.repository.create(attributes)
+            return CREATE_SUCCESS
+
+        # if user does exist, update by primary key
+        user = existing[0]
+        attributes.pop("customer_id", None)
+        unique_attributes.pop("customer_id", None)
+
+        # add updated_by
+        if "updated_by" in self.model.__table__.columns:
+            attributes["updated_by"] = self.account_id
+
+        self.repository.update(user.id, attributes)
+        return UPDATE_SUCCESS
+
+    def _check_permissions(self, customer_id=None):
+        if self.customer_list and customer_id and customer_id not in self.customer_list:
+            raise UnauthorizedError(NOT_PERMITTED)

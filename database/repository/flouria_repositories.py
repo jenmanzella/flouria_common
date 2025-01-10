@@ -1,10 +1,13 @@
-"""Repository functions for Flouria table models"""
+"""
+Repository functions for Flouria table models
+Author: Jen Manzella
+"""
 
 from datetime import datetime
 from typing import Any, TypeVar, Generic, Type, List, Optional, Union, Dict
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import delete, select, Date
+from sqlalchemy import and_, delete, select, Date
 
 from flouria_models.personal_table_models import (
     User,
@@ -14,14 +17,13 @@ from flouria_models.personal_table_models import (
     WritingEntry,
     Prompt,
     Contacts,
-    DateEntry,
     Health,
     Points,
+    Task,
     TaskList,
     Memories,
     Goal,
-    Rule,
-    RuleReports,
+    Subscription,
     ConnectToBody,
 )
 
@@ -37,17 +39,17 @@ class BaseRepository(Generic[MODELTYPE]):
         self,
         model: Type[MODELTYPE],
         db: Session,
+        customer: str = None
     ):
         """Initializes the BaseRepository class attributes"""
         self.db = db
         self.model: Type[MODELTYPE] = model
+        self.customer = customer
 
     def get_by_id(self, model_id: int) -> Optional[MODELTYPE]:
-        """Gets the table instance by the ID provided"""
-        query = select(self.model)
-        query = query.where(self.model.id == model_id)
-        result = self.db.execute(query).scalars().first()
-        return result
+        """Gets the table instance by its primary key, or None"""
+        query = select(self.model).where(self.model.id == model_id)
+        return self.db.execute(query).scalars().first()
 
     def get_all(self) -> List[MODELTYPE]:
         """Gets all instances of the table model"""
@@ -106,7 +108,7 @@ class BaseRepository(Generic[MODELTYPE]):
 
     def update(self, model_id: int, update_data: dict) -> MODELTYPE:
         """
-        Updates a model by ID. Only the fields provided in update_data will be updated.
+        Updates a model by ID. Only the fields provided in update_data are updated.
         """
         # Retrieve the model instance by ID
         model = self.get_by_id(model_id)
@@ -128,7 +130,7 @@ class BaseRepository(Generic[MODELTYPE]):
 
         return model
 
-    def get_by_date(self, selected_date) -> Optional[Union[MODELTYPE, List[MODELTYPE]]]:
+    def get_by_user_date(self, selected_date, user_id) -> Optional[Union[MODELTYPE, List[MODELTYPE]]]:
         """
         Retrieves one or multiple instances where date matches the
         date provided (str or Date type).
@@ -141,18 +143,24 @@ class BaseRepository(Generic[MODELTYPE]):
             selected_date = datetime.strptime(selected_date, "%Y-%m-%d").date()
 
         # Construct the query to match the date
-        query = select(self.model).where(self.model.date == selected_date)
+        query = select(self.model).where(
+            and_(
+                self.model.date == selected_date,
+                self.model.user_id == user_id
+            )
+        ).order_by(self.model.date.desc())
 
-        # Execute the query
-        results = self.db.execute(query).scalars().all()
+        # Double check that I'm executing this correctly
+        result = self.db.execute(query).fetchone()
 
-        return results
+        return result
 
     def add_all_jsonb(
         self,
         jsonb_fields,
         normal_fields,
         selected_date: Date,
+        user_id,
         update_data: dict,
         list_in_dict=False,
     ):
@@ -164,13 +172,18 @@ class BaseRepository(Generic[MODELTYPE]):
         """
 
         # Step 1: Get the existing record by the selected date
-        existing_record = self.get_by_date(selected_date)
+        existing_record = self.get_by_user_date(selected_date)
 
         if not existing_record:
             # No record found for the selected date, find the most recent previous record
             previous_record = (
                 self.db.query(self.model)
-                .filter(self.model.date < selected_date)
+                .filter(
+                    and_(
+                        self.model.date < selected_date,
+                        self.model.user_id == user_id
+                    )
+                )
                 .order_by(self.model.date.desc())
                 .first()
             )
@@ -267,10 +280,8 @@ class BaseRepository(Generic[MODELTYPE]):
 class UserRepository(BaseRepository[User]):
     """User Repository"""
 
-
-class DateEntryRepository(BaseRepository[DateEntry]):
-    """DateEntry Repository"""
-
+class SubscriptionRepository(BaseRepository[Subscription]):
+    """Subscription Repository"""
 
 class HealthRepository(BaseRepository[Health]):
     """Health Repository"""
@@ -279,7 +290,7 @@ class HealthRepository(BaseRepository[Health]):
 class AddictionManagementRepository(BaseRepository[AddictionManagement]):
     """Adderall Repository"""
 
-    def add_new_content(self, date, update_data):
+    def add_new_content(self, date, user_id, update_data):
         """Appends all new content in update_data"""
         jsonb_fields = {
             "triggers",
@@ -296,8 +307,9 @@ class AddictionManagementRepository(BaseRepository[AddictionManagement]):
             "substance",
             "prior_sleep",
         }
+
         self.add_all_jsonb(
-            jsonb_fields, normal_fields, date, update_data, list_in_dict=True
+            jsonb_fields, normal_fields, date, user_id, update_data, list_in_dict=True
         )
 
 
@@ -319,25 +331,77 @@ class PointsRepository(BaseRepository[Points]):
 class ContactsRepository(BaseRepository[Contacts]):
     """Contacts Repository"""
 
+class TaskRepository(BaseRepository[Task]):
+    """Task Repository"""
 
 class TaskListRepository(BaseRepository[TaskList]):
     """TaskList Repository"""
 
-    def add_new_content(self, date, update_data):
-        """Adds new task content"""
-        jsonb_fields = {"task_list"}
-        normal_fields = {"date"}
-        self.add_all_jsonb(jsonb_fields, normal_fields, date, update_data)
+    def update_task_list(self, user_id, selected_date, task_id, status, daily=False):
+        """Adds new task content. Add this to controller."""
+        # Step 1: Get the existing record by the selected date
+        # this wouldn't find the specific user, I'll have to change this
+        date_record = self.get_by_user_date(selected_date)
+
+        if not date_record:
+            # No record found for the selected date, find the most recent previous record
+            previous_record = (
+                self.db.query(self.model)
+                .filter(
+                    and_(
+                        self.model.date < selected_date,
+                        self.model.user_id == user_id
+                    )
+                )
+                .order_by(self.model.date.desc())
+                .first()
+            )
+
+            if previous_record:
+                previous_tasks = getattr(previous_record, "tasks", {})
+
+                # Retain tasks that were not completed in TaskList for most recent date
+                tasks = {task: status for task, status in previous_tasks.__dict__.items() if not status}
+
+                # previous_tasks = previous_record.daily_tasks
+                # daily_tasks = {task: False for task in previous_daily_tasks.keys()}
+
+                # Process daily_tasks
+                previous_daily_tasks = getattr(previous_record, "daily_tasks", {})
+                daily_tasks = {task: False for task in previous_daily_tasks.__dict__.keys()}
+
+                # would this actually be
+                # previous_daily_tasks = previous_record.daily_tasks
+                # daily_tasks = {task: False for task in previous_daily_tasks.keys()}
+
+            reset_data = {
+                "user_id": user_id,
+                "date": selected_date,
+                "tasks": tasks,
+                "daily_tasks": daily_tasks
+            }
+            
+            new_data = {
+                task_id: status
+            }
+            if daily:
+                reset_data.update(new_data)
+            
+            # COMBINE RESET DATA WITH NEW DATA FROM REQUEST
+            # merged_jsonb_data = {**existing_jsonb_data, **new_jsonb_data}
+
+            new_record = self.create(reset_data)
+            return new_record
 
 
 class AccountsRepository(BaseRepository[Accounts]):
     """Accounts Repository"""
 
-    def add_new_content(self, date, update_data):
+    def add_new_content(self, date, user_id, update_data):
         """Updates account balances"""
         jsonb_fields = {"account_balances"}
         normal_fields = {"date", "summary"}
-        self.add_all_jsonb(jsonb_fields, normal_fields, date, update_data)
+        self.add_all_jsonb(jsonb_fields, normal_fields, date, user_id, update_data)
 
 
 class MemoriesRepository(BaseRepository[Memories]):
@@ -369,20 +433,6 @@ class MemoriesRepository(BaseRepository[Memories]):
 
 class GoalRepository(BaseRepository[Goal]):
     """Goal Repository"""
-
-
-class RuleRepository(BaseRepository[Rule]):
-    """Rules Repository"""
-
-
-class RuleReportsRepository(BaseRepository[RuleReports]):
-    """RuleReports Repository"""
-
-    def add_new_content(self, date, update_data):
-        """Updates account balances"""
-        jsonb_fields = {"rules_followed"}
-        normal_fields = {"date"}
-        self.add_all_jsonb(jsonb_fields, normal_fields, date, update_data)
 
 
 class ConnectToBodyRepository(BaseRepository[ConnectToBody]):
